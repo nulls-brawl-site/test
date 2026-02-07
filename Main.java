@@ -53,6 +53,7 @@ public class Main {
 
     // Track expand buttons per ChatActivity instance using weak references
     private final WeakHashMap<Object, ImageView> expandButtons = new WeakHashMap<>();
+    private final WeakHashMap<EditText, TextWatcher> textWatchers = new WeakHashMap<>();
 
     private boolean isExpanded = false;
     private BottomSheet sheet;
@@ -83,6 +84,10 @@ public class Main {
     public void start() {
         if (!enabled) {
             Log.d(TAG, "Plugin disabled in settings; start() skipped");
+            return;
+        }
+        if (ApplicationLoader.applicationContext == null) {
+            Log.e(TAG, "Application context is null; start() aborted");
             return;
         }
         try {
@@ -207,6 +212,7 @@ public class Main {
                 hookRef = null;
             }
             expandButtons.clear();
+            textWatchers.clear();
             Log.d(TAG, "FullScreenTextEditor Dex unloaded");
         } catch (Throwable t) {
             Log.e(TAG, "Error during unload", t);
@@ -287,14 +293,19 @@ public class Main {
 
             Context context = getParentActivity(fragment);
             if (context == null) {
+                context = editField.getContext();
+            }
+            if (context == null) {
                 context = ApplicationLoader.applicationContext;
             }
+            if (context == null) return;
 
             // Create expand button
             ImageView expandBtn = new ImageView(context);
             expandBtn.setImageResource(R.drawable.pip_video_expand);
             expandBtn.setColorFilter(Theme.getColor(Theme.key_chat_messagePanelIcons));
             expandBtn.setScaleType(ImageView.ScaleType.CENTER);
+            expandBtn.setTag("full_screen_text_editor_expand");
 
             // Initial visibility based on current text length
             int currentLen = editField.getText() != null ? editField.getText().length() : 0;
@@ -310,14 +321,26 @@ public class Main {
             params.bottomMargin = AndroidUtilities.dp(48);
             params.rightMargin = AndroidUtilities.dp(4);
 
-            textFieldContainer.addView(expandBtn, params);
+            // Avoid duplicates if some previous injection left a view behind
+            boolean alreadyAdded = false;
+            for (int i = 0; i < textFieldContainer.getChildCount(); i++) {
+                View child = textFieldContainer.getChildAt(i);
+                if (child != null && "full_screen_text_editor_expand".equals(child.getTag())) {
+                    alreadyAdded = true;
+                    expandBtn = (ImageView) child;
+                    break;
+                }
+            }
+            if (!alreadyAdded) {
+                textFieldContainer.addView(expandBtn, params);
+            }
 
             // Hook up click listener
             Object frag = fragment;
             expandBtn.setOnClickListener(v -> expandEditor(frag, enterView, editField));
 
             // Text watcher to show/hide button
-            editField.addTextChangedListener(new TextWatcher() {
+            TextWatcher watcher = new TextWatcher() {
                 @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
                 @Override public void onTextChanged(CharSequence s, int start, int before, int count) {}
                 @Override public void afterTextChanged(Editable editable) {
@@ -329,7 +352,13 @@ public class Main {
                     boolean show = textLen >= threshold;
                     expandBtn.setVisibility(show ? View.VISIBLE : View.GONE);
                 }
-            });
+            };
+            TextWatcher existingWatcher = textWatchers.get(editField);
+            if (existingWatcher != null) {
+                editField.removeTextChangedListener(existingWatcher);
+            }
+            editField.addTextChangedListener(watcher);
+            textWatchers.put(editField, watcher);
 
             // Track the button so we can clean it up
             expandButtons.put(fragment, expandBtn);
@@ -351,7 +380,14 @@ public class Main {
         if (isExpanded) return;
         isExpanded = true;
         try {
+            if (sheet != null) {
+                sheet.dismiss();
+                sheet = null;
+            }
             Context ctx = getParentActivity(fragment);
+            if (ctx == null) {
+                ctx = editField.getContext();
+            }
             if (ctx == null) {
                 isExpanded = false;
                 return;
@@ -488,6 +524,7 @@ public class Main {
             // Click listeners for back/done
             backBtn.setOnClickListener(v -> {
                 sheet.dismiss();
+                AndroidUtilities.hideKeyboard(fe);
                 isExpanded = false;
             });
 
@@ -498,6 +535,7 @@ public class Main {
                     editField.setSelection(editField.getText().length());
                 }
                 sheet.dismiss();
+                AndroidUtilities.hideKeyboard(fe);
                 isExpanded = false;
             });
 
@@ -552,12 +590,26 @@ public class Main {
 
         CharSequence text = edit.getText();
         String selected = text.subSequence(start, end).toString();
+        int newStart = start;
+        int newEnd = end;
 
         if ("bold".equals(format)) {
             edit.getText().replace(start, end, "**" + selected + "**");
+            newStart = start;
+            newEnd = end + 4;
         } else if ("italic".equals(format)) {
             edit.getText().replace(start, end, "_" + selected + "_");
+            newStart = start;
+            newEnd = end + 2;
         }
+        edit.setSelection(newStart, newEnd);
+    }
+
+    /**
+     * Version accessor for loader compatibility checks.
+     */
+    public int getVersionCode() {
+        return VERSION_CODE;
     }
 
     /**

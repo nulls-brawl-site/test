@@ -27,7 +27,7 @@ __id__ = "text_editor_dex"
 __name__ = "Full‑Screen Text Editor (Dex)"
 __description__ = "Loads a Dex version of the Full‑Screen Text Editor plugin with logs support."
 __author__ = "AssistantBot"
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __icon__ = "Elaina_by_botireina_bot/0"
 __min_version__ = "12.2.10"
 
@@ -66,6 +66,10 @@ CLASS_NAME = "com.example.fullscreentexteditor.Main"
 METHOD_START = "start"
 METHOD_SETTINGS = "showSettings"
 METHOD_UNLOAD = "onUnload"
+METHOD_VERSION = "getVersionCode"
+
+# Minimum supported dex version code.
+MIN_VERSION_CODE = 1
 
 # Name of the directory under the app's files directory where the dex file
 # will be cached. A new file will only be downloaded when the cache is empty.
@@ -75,6 +79,15 @@ CACHE_FILE_NAME = "editor_v2.dex"
 # Name of the log file written by the loader. Each call to ``DexLoader.log``
 # appends a message to this file.
 LOG_FILE_NAME = "loader.log"
+
+# Limit log file size to avoid unbounded growth (bytes).
+MAX_LOG_BYTES = 64 * 1024
+
+# Max dex payload size to guard against unexpected downloads (bytes).
+MAX_DEX_BYTES = 5 * 1024 * 1024
+
+# Valid dex magic prefixes.
+DEX_MAGIC_PREFIXES = (b"dex\n035\x00", b"dex\n037\x00", b"dex\n038\x00", b"dex\n039\x00")
 
 
 class DexLoader:
@@ -108,6 +121,7 @@ class DexLoader:
             The message to log. A newline is appended automatically.
         """
         try:
+            self._trim_logs()
             with open(self.log_file, "a", encoding="utf-8") as f:
                 f.write(msg + "\n")
         except Exception:
@@ -134,10 +148,35 @@ class DexLoader:
         if os.path.exists(self.cache_file):
             try:
                 with open(self.cache_file, "rb") as f:
-                    return f.read()
+                    data = f.read()
+                if not self._validate_dex(data, source="cache"):
+                    self._delete_cache()
+                    return None
+                return data
             except Exception as e:
                 self.log(f"Cache read error: {e}")
         return None
+
+    def _delete_cache(self) -> None:
+        try:
+            if os.path.exists(self.cache_file):
+                os.remove(self.cache_file)
+        except Exception as e:
+            self.log(f"Cache delete error: {e}")
+
+    def _trim_logs(self) -> None:
+        try:
+            if os.path.exists(self.log_file):
+                size = os.path.getsize(self.log_file)
+                if size <= MAX_LOG_BYTES:
+                    return
+                with open(self.log_file, "rb") as f:
+                    f.seek(-MAX_LOG_BYTES, os.SEEK_END)
+                    data = f.read()
+                with open(self.log_file, "wb") as f:
+                    f.write(data)
+        except Exception:
+            pass
 
     def _download(self) -> bytes:
         """Download the dex from DEFAULT_URL and cache it."""
@@ -145,9 +184,23 @@ class DexLoader:
         r = requests.get(DEFAULT_URL, timeout=30)
         r.raise_for_status()
         data = r.content
+        if not self._validate_dex(data, source="download"):
+            raise ValueError("Downloaded file is not a valid dex")
         with open(self.cache_file, "wb") as f:
             f.write(data)
         return data
+
+    def _validate_dex(self, data: bytes, source: str) -> bool:
+        if not data:
+            self.log(f"Dex validation failed ({source}): empty payload")
+            return False
+        if len(data) > MAX_DEX_BYTES:
+            self.log(f"Dex validation failed ({source}): size {len(data)} exceeds limit")
+            return False
+        if not data.startswith(DEX_MAGIC_PREFIXES):
+            self.log(f"Dex validation failed ({source}): bad magic header")
+            return False
+        return True
 
     def _start_from_bytes(self, dex_bytes: bytes) -> None:
         """Load and start the dex module from raw bytes."""
@@ -164,6 +217,7 @@ class DexLoader:
             self.instance = get_instance.invoke(None)
         except Exception:
             self.instance = clazz.newInstance()
+        self._check_version(self.instance)
         # Invoke the start method
         try:
             start_method = clazz.getMethod(METHOD_START)
@@ -171,6 +225,19 @@ class DexLoader:
             self.log("Dex module started successfully")
         except Exception as e:
             self.log(f"Error invoking {METHOD_START}: {e}")
+            raise
+
+    def _check_version(self, instance: Any) -> None:
+        try:
+            method = instance.getClass().getMethod(METHOD_VERSION)
+            version_code = int(method.invoke(instance))
+            if version_code < MIN_VERSION_CODE:
+                raise ValueError(
+                    f"Dex version {version_code} below minimum {MIN_VERSION_CODE}"
+                )
+            self.log(f"Dex version OK: {version_code}")
+        except Exception as e:
+            self.log(f"Dex version check failed: {e}")
             raise
 
     # Public API --------------------------------------------------------------
@@ -190,6 +257,13 @@ class DexLoader:
                 get_last_fragment(),
             )
             self.unload()
+
+    def reload(self, force_download: bool = False) -> None:
+        """Reload the dex module and optionally force a new download."""
+        if force_download:
+            self._delete_cache()
+        self.unload()
+        self.load_and_start()
 
     def open_settings(self) -> None:
         """Invoke the dex module's settings UI if available."""
@@ -256,6 +330,10 @@ class Plugin(BasePlugin):
                 on_click=lambda view: self._open_settings(),
             ),
             Text(
+                text=self._reload_label(),
+                on_click=lambda view: self._reload(),
+            ),
+            Text(
                 text=self._logs_label(),
                 on_click=lambda view: self._open_logs(),
             ),
@@ -268,6 +346,10 @@ class Plugin(BasePlugin):
     def _logs_label(self) -> str:
         lang = LocaleController.getInstance().getCurrentLocale().getLanguage()
         return "Логи" if lang == "ru" else "Logs"
+
+    def _reload_label(self) -> str:
+        lang = LocaleController.getInstance().getCurrentLocale().getLanguage()
+        return "Перезагрузить и обновить" if lang == "ru" else "Reload & Update"
 
     # User actions ----------------------------------------------------------
 
@@ -302,3 +384,9 @@ class Plugin(BasePlugin):
             log_contents + "\n\n" + copied_msg,
             get_last_fragment(),
         )
+
+    def _reload(self) -> None:
+        """Reload dex and force refresh from network."""
+        if self.loader is None:
+            return
+        self.loader.reload(force_download=True)
