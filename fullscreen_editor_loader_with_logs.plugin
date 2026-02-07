@@ -1,0 +1,304 @@
+"""
+Fullscreen Text Editor Dex Plugin Loader with Logs Support.
+
+This module implements a dynamic loader for a compiled dex version of the
+Full‑Screen Text Editor for exteraGram. In addition to loading and starting
+the dex module on demand, it also provides a Logs section in the plugin
+settings. Users can view the internal loader logs and copy them to the
+clipboard for sharing or debugging purposes.
+
+The loader downloads the dex file from ``DEFAULT_URL``, caches it
+under the app's private files directory, and loads it via
+``InMemoryDexClassLoader``. It invokes the entrypoint defined by
+``CLASS_NAME`` and ``METHOD_START``. A ``DexLoader.log`` method writes
+messages to both the plugin logger and an on‑disk log file. The log file
+is used by ``open_logs`` to display the log content in a Bulletin and
+copy it to the clipboard.
+
+To integrate this loader into exteraGram, place this file in your plugin
+directory and set it as the main entry point in ``__init__.py``. This
+file assumes the presence of the ``base_plugin`` framework and the
+various Android/Telegram classes provided by exteraGram.
+"""
+
+from __future__ import annotations
+
+__id__ = "text_editor_dex"
+__name__ = "Full‑Screen Text Editor (Dex)"
+__description__ = "Loads a Dex version of the Full‑Screen Text Editor plugin with logs support."
+__author__ = "AssistantBot"
+__version__ = "1.1.0"
+__icon__ = "Elaina_by_botireina_bot/0"
+__min_version__ = "12.2.10"
+
+import os
+import requests
+from typing import Any, Iterable
+
+from base_plugin import BasePlugin
+from client_utils import get_last_fragment
+from ui.bulletin import BulletinHelper
+from ui.settings import Text
+from org.telegram.messenger import (
+    ApplicationLoader,
+    LocaleController,
+)
+from dalvik.system import InMemoryDexClassLoader
+from java.nio import ByteBuffer
+from android.app import Activity
+
+# Android clipboard imports for copying log contents
+from android.content import ClipData, ClipboardManager, Context
+
+# -----------------------------------------------------------------------------
+# Configuration constants.
+# -----------------------------------------------------------------------------
+
+# URL pointing to the Dex file for the FullScreenTextEditor implementation.
+# Replace this with your own hosted dex. No update checks are performed.
+DEFAULT_URL = "https://raw.githubusercontent.com/nulls-brawl-site/test/main/classes.dex"
+
+# Fully‑qualified name of the class inside the dex which contains the plugin
+# entrypoints. This class must define a public static ``getInstance()``
+# returning a singleton, or a public no‑arg constructor; and public methods
+# matching ``METHOD_START``, ``METHOD_SETTINGS`` and ``METHOD_UNLOAD``.
+CLASS_NAME = "com.example.fullscreentexteditor.Main"
+METHOD_START = "start"
+METHOD_SETTINGS = "showSettings"
+METHOD_UNLOAD = "onUnload"
+
+# Name of the directory under the app's files directory where the dex file
+# will be cached. A new file will only be downloaded when the cache is empty.
+CACHE_DIR_NAME = "text_editor_dex_cache"
+CACHE_FILE_NAME = "editor_v2.dex"
+
+# Name of the log file written by the loader. Each call to ``DexLoader.log``
+# appends a message to this file.
+LOG_FILE_NAME = "loader.log"
+
+
+class DexLoader:
+    """Loads and manages the FullScreenTextEditor Dex module.
+
+    This helper encapsulates downloading, caching, loading, and unloading
+    the external dex module. It exposes methods to start the plugin,
+    invoke its settings UI, and unload it. It also maintains a log file
+    where internal loader messages are written.
+    """
+
+    def __init__(self, plugin: BasePlugin) -> None:
+        self.plugin = plugin
+        self.instance = None  # Java instance of Main class
+        self.dex_loader: InMemoryDexClassLoader | None = None
+        ctx = ApplicationLoader.applicationContext
+        files_dir = ctx.getFilesDir().getAbsolutePath()
+        self.cache_dir = os.path.join(files_dir, CACHE_DIR_NAME)
+        self.cache_file = os.path.join(self.cache_dir, CACHE_FILE_NAME)
+        self.log_file = os.path.join(self.cache_dir, LOG_FILE_NAME)
+        os.makedirs(self.cache_dir, exist_ok=True)
+
+    # Logging -----------------------------------------------------------------
+
+    def log(self, msg: str) -> None:
+        """Append a message to the log file and echo it via the plugin logger.
+
+        Parameters
+        ----------
+        msg : str
+            The message to log. A newline is appended automatically.
+        """
+        try:
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except Exception:
+            pass
+        # Also log via plugin (shown in debug console or logcat)
+        self.plugin.log(msg)
+
+    def read_logs(self) -> str:
+        """Return the contents of the log file as a string.
+
+        If the log file does not exist or cannot be read, returns an empty
+        string.
+        """
+        try:
+            with open(self.log_file, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception:
+            return ""
+
+    # Internal helpers --------------------------------------------------------
+
+    def _read_cache(self) -> bytes | None:
+        """Return the cached dex as bytes, or None if not cached."""
+        if os.path.exists(self.cache_file):
+            try:
+                with open(self.cache_file, "rb") as f:
+                    return f.read()
+            except Exception as e:
+                self.log(f"Cache read error: {e}")
+        return None
+
+    def _download(self) -> bytes:
+        """Download the dex from DEFAULT_URL and cache it."""
+        self.log(f"Downloading dex from {DEFAULT_URL}")
+        r = requests.get(DEFAULT_URL, timeout=30)
+        r.raise_for_status()
+        data = r.content
+        with open(self.cache_file, "wb") as f:
+            f.write(data)
+        return data
+
+    def _start_from_bytes(self, dex_bytes: bytes) -> None:
+        """Load and start the dex module from raw bytes."""
+        buffer = ByteBuffer.wrap(dex_bytes)
+        # Create a new DexClassLoader with the existing app classloader as parent
+        self.dex_loader = InMemoryDexClassLoader(
+            buffer,
+            ApplicationLoader.applicationContext.getClassLoader(),
+        )
+        clazz = self.dex_loader.loadClass(CLASS_NAME)
+        # Obtain instance via getInstance() or default constructor
+        try:
+            get_instance = clazz.getMethod("getInstance")
+            self.instance = get_instance.invoke(None)
+        except Exception:
+            self.instance = clazz.newInstance()
+        # Invoke the start method
+        try:
+            start_method = clazz.getMethod(METHOD_START)
+            start_method.invoke(self.instance)
+            self.log("Dex module started successfully")
+        except Exception as e:
+            self.log(f"Error invoking {METHOD_START}: {e}")
+            raise
+
+    # Public API --------------------------------------------------------------
+
+    def load_and_start(self) -> None:
+        """Load (or download) the dex module and invoke its start method."""
+        try:
+            dex_bytes = self._read_cache()
+            if dex_bytes is None:
+                dex_bytes = self._download()
+            self._start_from_bytes(dex_bytes)
+        except Exception as e:
+            # On any failure, unload and notify the user
+            self.log(f"Dex load/start error: {e}")
+            BulletinHelper.show_info(
+                f"Ошибка загрузки текстового редактора:\n{e}",
+                get_last_fragment(),
+            )
+            self.unload()
+
+    def open_settings(self) -> None:
+        """Invoke the dex module's settings UI if available."""
+        if self.instance is None:
+            return
+        try:
+            method = self.instance.getClass().getMethod(METHOD_SETTINGS)
+            method.invoke(self.instance)
+        except Exception as e:
+            self.log(f"Error opening settings: {e}")
+            BulletinHelper.show_info(
+                f"Error opening editor settings:\n{e}", get_last_fragment(),
+            )
+
+    def unload(self) -> None:
+        """Invoke the dex module's unload method (if present) and release resources."""
+        try:
+            if self.instance is not None:
+                try:
+                    method = self.instance.getClass().getMethod(METHOD_UNLOAD)
+                    method.invoke(self.instance)
+                except Exception:
+                    pass
+        finally:
+            self.instance = None
+            self.dex_loader = None
+            self.log("Dex module unloaded")
+
+
+class Plugin(BasePlugin):
+    """Plugin entry point for the Full‑Screen Text Editor dex loader.
+
+    When loaded by exteraGram, this plugin will download and start the
+    Full‑Screen Text Editor dex module. It also exposes two settings
+    entries: one to open the editor's own settings UI and one to view
+    the loader logs.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.loader: DexLoader | None = None
+
+    # Plugin lifecycle methods ---------------------------------------------
+
+    def on_plugin_load(self) -> None:
+        """Called by the plugin framework when this plugin is loaded."""
+        self.log(f"Initializing Full‑Screen Text Editor Dex loader v{__version__}")
+        self.loader = DexLoader(self)
+        self.loader.load_and_start()
+
+    def on_plugin_unload(self) -> None:
+        """Called when the plugin is being unloaded."""
+        if self.loader is not None:
+            self.loader.unload()
+            self.loader = None
+
+    # Settings UI -----------------------------------------------------------
+
+    def create_settings(self) -> Iterable[Any]:
+        """Return a list of settings entries for the plugin UI."""
+        return [
+            Text(
+                text=self._settings_label(),
+                on_click=lambda view: self._open_settings(),
+            ),
+            Text(
+                text=self._logs_label(),
+                on_click=lambda view: self._open_logs(),
+            ),
+        ]
+
+    def _settings_label(self) -> str:
+        lang = LocaleController.getInstance().getCurrentLocale().getLanguage()
+        return "Настройки редактора" if lang == "ru" else "Editor Settings"
+
+    def _logs_label(self) -> str:
+        lang = LocaleController.getInstance().getCurrentLocale().getLanguage()
+        return "Логи" if lang == "ru" else "Logs"
+
+    # User actions ----------------------------------------------------------
+
+    def _open_settings(self) -> None:
+        """Trigger opening of the editor's settings from the dex module."""
+        if self.loader is not None:
+            self.loader.open_settings()
+
+    def _open_logs(self) -> None:
+        """Display and copy the loader's log contents to the clipboard."""
+        if self.loader is None:
+            return
+        log_contents = self.loader.read_logs().strip()
+        if not log_contents:
+            BulletinHelper.show_info(
+                "Нет логов для отображения" if LocaleController.getInstance().getCurrentLocale().getLanguage() == "ru" else "No logs to display",
+                get_last_fragment(),
+            )
+            return
+        # Copy logs to clipboard
+        try:
+            ctx = ApplicationLoader.applicationContext
+            clipboard = ctx.getSystemService(Context.CLIPBOARD_SERVICE)
+            clip = ClipData.newPlainText("FullScreenEditorLogs", log_contents)
+            clipboard.setPrimaryClip(clip)
+            copied_msg = "Скопировано в буфер обмена" if LocaleController.getInstance().getCurrentLocale().getLanguage() == "ru" else "Logs copied to clipboard"
+        except Exception as e:
+            self.loader.log(f"Clipboard error: {e}")
+            copied_msg = "Ошибка копирования" if LocaleController.getInstance().getCurrentLocale().getLanguage() == "ru" else "Copy error"
+        # Show bulletin with log contents
+        BulletinHelper.show_info(
+            log_contents + "\n\n" + copied_msg,
+            get_last_fragment(),
+        )
